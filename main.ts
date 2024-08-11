@@ -1,134 +1,260 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import {
+    App,
+    Plugin,
+    PluginSettingTab,
+    Setting,
+    TFile,
+    Notice,
+    requestUrl,
+    RequestUrlResponse,
+    MarkdownView
+} from "obsidian";
 
-// Remember to rename these classes and interfaces!
-
-interface MyPluginSettings {
-	mySetting: string;
+interface AIAssistantSettings {
+    apiKey: string;
+    modelName: string;
+    baseURL: string;
+    customPrompt: string;
+    maxResults: number;
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+const DEFAULT_SETTINGS: AIAssistantSettings = {
+    apiKey: "",
+    modelName: "openai/gpt-4o-mini-2024-07-18",
+    baseURL: "https://openrouter.ai/api/v1",
+	customPrompt: `
+	请根据以下笔记的标题和内容，生成最多4个最贴合、最精准的标签。重要提示：
+	1. 只生成真正相关和必要的标签，不要强行填满4个。
+	2. 如果内容只能概括出较少的标签，请只返回这些精确的标签。
+	3. 每个标签不超过3个词，不包含#符号。
+	4. 直接列出标签，用逗号分隔，不要有其他解释。
+	`,
+    maxResults: 4
+};
+
+export default class AIAssistant extends Plugin {
+    settings: AIAssistantSettings;
+
+    async onload() {
+        await this.loadSettings();
+
+        this.addCommand({
+            id: "generate-ai-tags",
+            name: "生成AI标签",
+            callback: () => this.generateTags()
+        });
+
+        this.addRibbonIcon("tag", "生成AI标签", () => {
+            this.generateTags();
+        });
+
+        this.registerEvent(
+            this.app.workspace.on("file-menu", (menu, file) => {
+                menu.addItem((item) => {
+                    item.setTitle("生成AI标签")
+                        .setIcon("tag")
+                        .onClick(() => this.generateTags());
+                });
+            })
+        );
+
+        this.addSettingTab(new AIAssistantSettingTab(this.app, this));
+    }
+
+    async loadSettings() {
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings);
+    }
+
+    async generateTags() {
+        const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!activeView) {
+            new Notice("没有活动的Markdown视图");
+            return;
+        }
+
+        const editor = activeView.editor;
+        const selectedText = editor.getSelection();
+        const file = activeView.file;
+
+        if (!file) {
+            new Notice("没有活动的文件");
+            return;
+        }
+
+        try {
+            let tags;
+            if (selectedText) {
+                // 如果有选中文本，只根据选中的文本生成标签
+                tags = await this.getTagsFromAI("", selectedText);
+            } else {
+                // 如果没有选中文本，使用标题和整个笔记内容生成标签
+                const fullContent = editor.getValue();
+                tags = await this.getTagsFromAI(file.basename, fullContent);
+            }
+
+            if (tags && tags.length > 0) {
+                await this.updateFileTags(file, tags);
+            } else {
+                new Notice("未能生成标签");
+            }
+        } catch (error) {
+            console.error("生成标签时发生错误:", error);
+            new Notice("生成标签时发生错误");
+        }
+    }
+
+    async getTagsFromAI(title: string, content: string): Promise<string[]> {
+        const apiUrl = `${this.settings.baseURL}/chat/completions`;
+        const prompt = `${this.settings.customPrompt}
+
+${title ? `标题: "${title}"` : ''}
+
+内容:
+${content.substring(0, 1000)}
+
+请生成标签:`;
+
+        try {
+            const response: RequestUrlResponse = await requestUrl({
+                url: apiUrl,
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${this.settings.apiKey}`,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    model: this.settings.modelName,
+                    messages: [
+                        {
+                            role: "system",
+                            content: "你是一个专业的笔记标签生成助手，善于提炼核心概念，只生成真正相关和必要的标签。请用中文回答。",
+                        },
+                        { role: "user", content: prompt },
+                    ],
+                }),
+            });
+
+            if (response.status === 200) {
+                const result = JSON.parse(response.text);
+                const content = result.choices[0].message.content.trim();
+                const tags = content
+                    .split(/[,，]/)  // 同时处理英文逗号和中文逗号
+                    .map((tag: string) => tag.trim())
+                    .filter((tag: string) => tag !== "");
+
+                return tags.slice(0, this.settings.maxResults);
+            } else {
+                console.error("AI API 请求失败:", response.status, response.text);
+                throw new Error("AI API 请求失败");
+            }
+        } catch (error) {
+            console.error("调用 AI API 时发生错误:", error);
+            throw error;
+        }
+    }
+
+    async updateFileTags(file: TFile, newTags: string[]) {
+        const content = await this.app.vault.read(file);
+        const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter;
+
+        let newContent: string;
+
+        if (frontmatter) {
+            const updatedFrontmatter = { ...frontmatter, tags: newTags };
+            const frontmatterStr = JSON.stringify(updatedFrontmatter, null, 2);
+            newContent = content.replace(/^---\n([\s\S]*?)\n---/, `---\n${frontmatterStr}\n---`);
+        } else {
+            const frontmatterStr = JSON.stringify({ tags: newTags }, null, 2);
+            newContent = `---\n${frontmatterStr}\n---\n\n${content}`;
+        }
+
+        await this.app.vault.modify(file, newContent);
+
+        new Notice(`标签已更新: ${newTags.join(", ")}`);
+    }
 }
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+class AIAssistantSettingTab extends PluginSettingTab {
+    plugin: AIAssistant;
 
-	async onload() {
-		await this.loadSettings();
+    constructor(app: App, plugin: AIAssistant) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
+    display(): void {
+        const { containerEl } = this;
+        containerEl.empty();
+        containerEl.createEl("h2", { text: "AI 标签助手设置" });
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
+        new Setting(containerEl)
+            .setName("API 密钥")
+            .setDesc("输入你的 AI 服务 API 密钥")
+            .addText((text) =>
+                text
+                    .setPlaceholder("输入 API 密钥")
+                    .setValue(this.plugin.settings.apiKey)
+                    .onChange(async (value) => {
+                        this.plugin.settings.apiKey = value;
+                        await this.plugin.saveSettings();
+                    }),
+            );
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+        new Setting(containerEl)
+            .setName("模型名称")
+            .setDesc("输入 AI 模型名称")
+            .addText((text) =>
+                text
+                    .setPlaceholder("输入模型名称")
+                    .setValue(this.plugin.settings.modelName)
+                    .onChange(async (value) => {
+                        this.plugin.settings.modelName = value;
+                        await this.plugin.saveSettings();
+                    }),
+            );
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
-		});
+        new Setting(containerEl)
+            .setName("AI 服务基础 URL")
+            .setDesc("输入 AI 服务的基础 URL（例如：https://api.openai.com/v1）")
+            .addText((text) =>
+                text
+                    .setPlaceholder("输入基础 URL")
+                    .setValue(this.plugin.settings.baseURL)
+                    .onChange(async (value) => {
+                        this.plugin.settings.baseURL = value;
+                        await this.plugin.saveSettings();
+                    }),
+            );
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+        new Setting(containerEl)
+            .setName("自定义提示")
+            .setDesc("输入你的自定义提示")
+            .addTextArea((text) =>
+                text
+                    .setPlaceholder("输入自定义提示")
+                    .setValue(this.plugin.settings.customPrompt)
+                    .onChange(async (value) => {
+                        this.plugin.settings.customPrompt = value;
+                        await this.plugin.saveSettings();
+                    }),
+            );
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-	}
-
-	onunload() {
-
-	}
-
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
-
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
-	}
-
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
-	}
-
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
-	}
-}
-
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
-
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
-
-	display(): void {
-		const {containerEl} = this;
-
-		containerEl.empty();
-
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
-	}
+        new Setting(containerEl)
+            .setName("最大标签数量")
+            .setDesc("设置生成标签的最大数量")
+            .addSlider((slider) =>
+                slider
+                    .setLimits(1, 10, 1)
+                    .setValue(this.plugin.settings.maxResults)
+                    .setDynamicTooltip()
+                    .onChange(async (value) => {
+                        this.plugin.settings.maxResults = value;
+                        await this.plugin.saveSettings();
+                    }),
+            );
+    }
 }
